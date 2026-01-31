@@ -34,6 +34,8 @@ async function run() {
     const parcelsCollection = database.collection("parcels");
     const paymentsCollection = database.collection("payments");
 
+    await parcelsCollection.createIndex({ trackingId: 1 }, { unique: true });
+
     app.get("/parcels", async (req, res) => {
       const cursor = parcelsCollection.find();
       const parcels = await cursor.toArray();
@@ -87,6 +89,46 @@ async function run() {
         res.status(500).send({ message: err.message });
       }
     });
+
+    // Track parcel by trackingId (public id)
+    app.get("/parcels/track/:trackingId", async (req, res) => {
+      try {
+        const { trackingId } = req.params;
+
+        if (!trackingId) {
+          return res.status(400).send({ message: "trackingId is required" });
+        }
+
+        const parcel = await parcelsCollection.findOne({ trackingId });
+
+        if (!parcel) {
+          return res.status(404).send({ message: "Parcel not found" });
+        }
+
+        // Return only what's needed for tracking UI
+        res.send({
+          _id: parcel._id,
+          trackingId: parcel.trackingId,
+          parcelTitle: parcel.parcelTitle,
+          parcelType: parcel.parcelType,
+          paymentType: parcel.paymentType,
+          deliveryCost: parcel.deliveryCost,
+           codAmount: parcel.codAmount,
+
+          senderRegion: parcel.senderRegion,
+          senderCenter: parcel.senderCenter,
+          receiverRegion: parcel.receiverRegion,
+          receiverCenter: parcel.receiverCenter,
+
+          status: parcel.status,
+          statusHistory: parcel.statusHistory || [],
+          createdAtISO: parcel.createdAtISO,
+        });
+      } catch (err) {
+        res.status(500).send({ message: err.message });
+      }
+    });
+
 
     app.post("/parcels", async (req, res) => {
       const parcel = req.body;
@@ -166,6 +208,7 @@ async function run() {
           parcelId: new ObjectId(parcelId),
           userEmail,
           userName: userName || "",
+          parcelName: parcel.parcelTitle,
 
           amount: pi.amount / 100,
           amountInCents: pi.amount,
