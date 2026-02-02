@@ -31,10 +31,82 @@ async function run() {
     await client.connect();
 
     const database = client.db("parcelDB");
+    const usersCollection = database.collection("users");
     const parcelsCollection = database.collection("parcels");
     const paymentsCollection = database.collection("payments");
 
     await parcelsCollection.createIndex({ trackingId: 1 }, { unique: true });
+    await usersCollection.createIndex({ uid: 1 }, { unique: true });
+    await usersCollection.createIndex(
+      { email: 1 },
+      { unique: true, sparse: true },
+    );
+
+    // Create user if not exists, otherwise update lastLogin + profile
+    app.post("/users", async (req, res) => {
+      try {
+        const { uid, email, name, photoURL, provider } = req.body;
+
+        if (!uid) return res.status(400).send({ message: "uid required" });
+
+        const now = new Date();
+
+        const existing = await usersCollection.findOne({ uid });
+
+        if (existing) {
+          // Update login + latest profile info (NO role change here)
+          await usersCollection.updateOne(
+            { uid },
+            {
+              $set: {
+                email: email ?? existing.email ?? null,
+                name: name ?? existing.name ?? "",
+                photoURL: photoURL ?? existing.photoURL ?? "",
+                provider: provider ?? existing.provider ?? "unknown",
+                lastLoginAt: now,
+                updatedAt: now,
+              },
+            },
+          );
+
+          return res.send({
+            message: "User exists, login updated",
+            isNewUser: false,
+          });
+        }
+
+        // Insert new user
+        const userDoc = {
+          uid,
+          email: email || null,
+          name: name || "",
+          photoURL: photoURL || "",
+          provider: provider || "unknown",
+
+          role: "user", // default role
+          status: "active",
+
+          createdAt: now,
+          updatedAt: now,
+          lastLoginAt: now,
+        };
+
+        const result = await usersCollection.insertOne(userDoc);
+
+        res.status(201).send({
+          message: "New user created",
+          isNewUser: true,
+          insertedId: result.insertedId,
+        });
+      } catch (err) {
+        if (String(err?.code) === "11000") {
+          return res
+            .status(409)
+            .send({ message: "User already exists (duplicate)" });
+        }
+        res.status(500).send({ message: err.message });
+      }
+    });
 
     app.get("/parcels", async (req, res) => {
       const cursor = parcelsCollection.find();
@@ -113,7 +185,7 @@ async function run() {
           parcelType: parcel.parcelType,
           paymentType: parcel.paymentType,
           deliveryCost: parcel.deliveryCost,
-           codAmount: parcel.codAmount,
+          codAmount: parcel.codAmount,
 
           senderRegion: parcel.senderRegion,
           senderCenter: parcel.senderCenter,
@@ -128,7 +200,6 @@ async function run() {
         res.status(500).send({ message: err.message });
       }
     });
-
 
     app.post("/parcels", async (req, res) => {
       const parcel = req.body;
