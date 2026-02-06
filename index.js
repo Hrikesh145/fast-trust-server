@@ -42,6 +42,20 @@ async function run() {
       { unique: true, sparse: true },
     );
 
+    // Custom Middleware
+    const verifyFBToken = (req, res, next) =>{
+      // console.log('Header in middleware ', req.headers);
+      const authHeader = req.headers.authorization;
+      if (!authHeader){
+        return res.status(401).send({message:'Unauthorized access'})
+      }
+      const token = authHeader.split(' ')[1];
+      if(!token){
+        return res.status(401).send({message:'Unauthorized access'})
+      }
+      next();
+    }
+
     // Create user if not exists, otherwise update lastLogin + profile
     app.post("/users", async (req, res) => {
       try {
@@ -145,7 +159,8 @@ async function run() {
     });
 
     //payment get
-    app.get("/payments", async (req, res) => {
+    app.get("/payments",verifyFBToken, async (req, res) => {
+      // console.log('Headers in payment',req.headers);
       try {
         const userEmail = req.query.email; // ideally from req.user.email
         if (!userEmail)
