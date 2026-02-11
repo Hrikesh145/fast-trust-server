@@ -3,6 +3,7 @@ const cors = require("cors");
 const dotenv = require("dotenv");
 const { MongoClient, ServerApiVersion } = require("mongodb");
 const { ObjectId } = require("mongodb");
+const admin = require("firebase-admin");
 
 dotenv.config();
 
@@ -13,6 +14,12 @@ const port = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+const serviceAccount = require("./firebase-admin-key.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.nkuntqh.mongodb.net/?appName=Cluster0`;
 
@@ -34,27 +41,43 @@ async function run() {
     const usersCollection = database.collection("users");
     const parcelsCollection = database.collection("parcels");
     const paymentsCollection = database.collection("payments");
-
+    const ridersCollection = database.collection("riders");
     await parcelsCollection.createIndex({ trackingId: 1 }, { unique: true });
     await usersCollection.createIndex({ uid: 1 }, { unique: true });
     await usersCollection.createIndex(
       { email: 1 },
       { unique: true, sparse: true },
     );
+    await ridersCollection.createIndex(
+      { phone: 1 },
+      { unique: true, sparse: true },
+    );
+    await ridersCollection.createIndex(
+      { nid: 1 },
+      { unique: true, sparse: true },
+    );
 
     // Custom Middleware
-    const verifyFBToken = (req, res, next) =>{
+    const verifyFBToken = async (req, res, next) => {
       // console.log('Header in middleware ', req.headers);
       const authHeader = req.headers.authorization;
-      if (!authHeader){
-        return res.status(401).send({message:'Unauthorized access'})
+      if (!authHeader) {
+        return res.status(401).send({ message: "Unauthorized access" });
       }
-      const token = authHeader.split(' ')[1];
-      if(!token){
-        return res.status(401).send({message:'Unauthorized access'})
+      const token = authHeader.split(" ")[1];
+      if (!token) {
+        return res.status(401).send({ message: "Unauthorized access" });
       }
-      next();
-    }
+
+      // verify the token
+      try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.decoded = decoded;
+        next();
+      } catch (error) {
+        return res.status(403).send({ message: "Forbidden access" });
+      }
+    };
 
     // Create user if not exists, otherwise update lastLogin + profile
     app.post("/users", async (req, res) => {
@@ -122,7 +145,7 @@ async function run() {
       }
     });
 
-    app.get("/parcels", async (req, res) => {
+    app.get("/parcels", verifyFBToken, async (req, res) => {
       const cursor = parcelsCollection.find();
       const parcels = await cursor.toArray();
       res.send(parcels);
@@ -159,7 +182,7 @@ async function run() {
     });
 
     //payment get
-    app.get("/payments",verifyFBToken, async (req, res) => {
+    app.get("/payments", verifyFBToken, async (req, res) => {
       // console.log('Headers in payment',req.headers);
       try {
         const userEmail = req.query.email; // ideally from req.user.email
@@ -325,6 +348,228 @@ async function run() {
             .send({ message: "Payment already recorded for this parcel" });
         }
         res.status(500).send({ message: err.message });
+      }
+    });
+
+    app.post("/riders", verifyFBToken, async (req, res) => {
+      // ✅ Add auth
+      try {
+        const rider = req.body;
+
+        // ✅ Check for duplicates
+        const existingPhone = await ridersCollection.findOne({
+          phone: rider.phone,
+        });
+        if (existingPhone) {
+          return res.status(409).send({
+            message: "Phone number already registered",
+          });
+        }
+
+        const existingNID = await ridersCollection.findOne({ nid: rider.nid });
+        if (existingNID) {
+          return res.status(409).send({
+            message: "NID already registered",
+          });
+        }
+
+        const result = await ridersCollection.insertOne(rider);
+        res.send(result);
+      } catch (err) {
+        if (String(err?.code) === "11000") {
+          return res.status(409).send({
+            message: "Phone or NID already exists",
+          });
+        }
+        console.error("Rider creation error:", err);
+        res.status(500).send({ message: err.message });
+      }
+    });
+
+    // GET /pending-riders - Fetch all pending riders
+    app.get("/pending-riders", async (req, res) => {
+      try {
+        const { page = 1, limit = 10 } = req.query;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const riders = await ridersCollection
+          .find({ status: "pending" })
+          .sort({ createdAtISO: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await ridersCollection.countDocuments({
+          status: "pending",
+        });
+
+        console.log(`📋 Found ${riders.length} pending riders`);
+        res.send({
+          riders,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total,
+            pages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("❌ Pending riders error:", error);
+        res.status(500).send({ error: "Failed to fetch riders" });
+      }
+    });
+
+    // 🔥 APPROVE RIDER - PATCH /riders/:id/approve
+    app.patch("/riders/:id/approve", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        // Verify ObjectId & rider exists + is pending
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid rider ID" });
+        }
+
+        const result = await ridersCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            status: "pending", // Only approve pending riders
+          },
+          {
+            $set: {
+              status: "approved",
+              approvedAt: new Date().toISOString(),
+            },
+          },
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(404).send({
+            message: "Rider not found or already processed",
+          });
+        }
+
+        console.log(`✅ Rider approved: ${id}`);
+        res.json({
+          success: true,
+          message: "Rider approved successfully!",
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error("❌ Approve error:", error);
+        res.status(500).json({ error: "Failed to approve rider" });
+      }
+    });
+
+    // 🔥 REJECT RIDER - PATCH /riders/:id/reject
+    app.patch("/riders/:id/reject", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid rider ID" });
+        }
+
+        const result = await ridersCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            status: "pending", // Only reject pending riders
+          },
+          {
+            $set: {
+              status: "rejected",
+              rejectedAt: new Date().toISOString(),
+            },
+          },
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(404).send({
+            message: "Rider not found or already processed",
+          });
+        }
+
+        console.log(`❌ Rider rejected: ${id}`);
+        res.json({
+          success: true,
+          message: "Rider rejected successfully!",
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error("❌ Reject error:", error);
+        res.status(500).json({ error: "Failed to reject rider" });
+      }
+    });
+    // 🔥 GET ACTIVE RIDERS (status: "approved")
+    app.get("/active-riders", async (req, res) => {
+      try {
+        const { page = 1, limit = 10, search = "" } = req.query;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        let query = { status: "approved" };
+        if (search) {
+          query.$or = [
+            { name: { $regex: search, $options: "i" } },
+            { phone: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        const riders = await ridersCollection
+          .find(query)
+          .sort({ approvedAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await ridersCollection.countDocuments(query);
+
+        console.log(`📋 Found ${riders.length} active riders`);
+        res.send({
+          riders,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total,
+            pages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("Active riders error:", error);
+        res.status(500).send({ error: "Failed to fetch active riders" });
+      }
+    });
+
+    // 🔥 DEACTIVATE RIDER - PATCH /riders/:id/deactivate
+    app.patch("/riders/:id/deactivate", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid rider ID" });
+        }
+
+        const result = await ridersCollection.updateOne(
+          { _id: new ObjectId(id), status: "approved" },
+          {
+            $set: {
+              status: "deactivated",
+              deactivatedAt: new Date().toISOString(),
+            },
+          },
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(404).send({ message: "Active rider not found" });
+        }
+
+        console.log(`⛔ Rider deactivated: ${id}`);
+        res.json({
+          success: true,
+          message: "Rider deactivated successfully!",
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Deactivate error:", error);
+        res.status(500).json({ error: "Failed to deactivate rider" });
       }
     });
 
