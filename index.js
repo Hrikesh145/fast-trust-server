@@ -1,11 +1,11 @@
 const express = require("express");
 const cors = require("cors");
-const dotenv = require("dotenv");  
+const dotenv = require("dotenv");
 const { MongoClient, ServerApiVersion } = require("mongodb");
 const { ObjectId } = require("mongodb");
 const admin = require("firebase-admin");
 
-dotenv.config();   
+dotenv.config();
 
 const stripe = require("stripe")(process.env.PAYMENT_GATEWAY_KEY);
 
@@ -18,12 +18,12 @@ app.use(express.json());
 // 🔥 YOUR NEW FIREBASE CODE (REPLACE):
 const serviceAccount = {
   projectId: process.env.FIREBASE_PROJECT_ID,
-  privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
   clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
 };
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(serviceAccount),
 });
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.nkuntqh.mongodb.net/?appName=Cluster0`;
 
@@ -80,6 +80,23 @@ async function run() {
         next();
       } catch (error) {
         return res.status(403).send({ message: "Forbidden access" });
+      }
+    };
+
+    // admin
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        const email = req.decoded?.email;
+        if (!email) return res.status(401).send({ message: "Unauthorized" });
+
+        const user = await usersCollection.findOne({ email });
+        if (!user || user.role !== "admin") {
+          return res.status(403).send({ message: "Forbidden (admin only)" });
+        }
+
+        next();
+      } catch (err) {
+        res.status(500).send({ message: err.message });
       }
     };
 
@@ -148,6 +165,86 @@ async function run() {
         res.status(500).send({ message: err.message });
       }
     });
+
+    //admin
+    app.get("/users/search", verifyFBToken, verifyAdmin, async (req, res) => {
+      try {
+        const q = String(req.query.q || "").trim();
+        const limit = Math.min(parseInt(req.query.limit || "10"), 20);
+
+        if (!q || q.length < 2) {
+          return res.send({ users: [] });
+        }
+
+        const query = {
+          $or: [
+            { email: { $regex: q, $options: "i" } },
+            { name: { $regex: q, $options: "i" } },
+          ],
+        };
+
+        const users = await usersCollection
+          .find(query, {
+            projection: { email: 1, name: 1, role: 1, status: 1, createdAt: 1 },
+          })
+          .sort({ createdAt: -1 })
+          .limit(limit)
+          .toArray();
+
+        res.send({ users });
+      } catch (err) {
+        res.status(500).send({ message: err.message });
+      }
+    });
+
+    app.patch(
+      "/users/:id/role",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { role } = req.body;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({ message: "Invalid user ID" });
+          }
+
+          const allowed = ["user", "admin", "rider"];
+          if (!allowed.includes(role)) {
+            return res.status(400).send({ message: "Invalid role" });
+          }
+
+          // Optional safety: prevent removing your own admin
+          const me = req.decoded?.email;
+          const target = await usersCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!target)
+            return res.status(404).send({ message: "User not found" });
+
+          if (target.email === me && role !== "admin") {
+            return res
+              .status(400)
+              .send({ message: "You cannot remove your own admin role" });
+          }
+
+          const result = await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { role, updatedAt: new Date() } },
+          );
+
+          res.send({
+            success: true,
+            message: `Role updated to ${role}`,
+            modifiedCount: result.modifiedCount,
+          });
+        } catch (err) {
+          res.status(500).send({ message: err.message });
+        }
+      },
+    );
 
     app.get("/parcels", verifyFBToken, async (req, res) => {
       const cursor = parcelsCollection.find();
@@ -424,43 +521,71 @@ async function run() {
     });
 
     // 🔥 APPROVE RIDER - PATCH /riders/:id/approve
-    app.patch("/riders/:id/approve", async (req, res) => {
+    app.patch("/riders/:id/approve", verifyFBToken, async (req, res) => {
       try {
         const id = req.params.id;
 
-        // Verify ObjectId & rider exists + is pending
         if (!ObjectId.isValid(id)) {
           return res.status(400).send({ message: "Invalid rider ID" });
         }
 
-        const result = await ridersCollection.updateOne(
-          {
-            _id: new ObjectId(id),
-            status: "pending", // Only approve pending riders
-          },
-          {
-            $set: {
-              status: "approved",
-              approvedAt: new Date().toISOString(),
-            },
-          },
-        );
+        // 1) Find the pending rider first
+        const rider = await ridersCollection.findOne({
+          _id: new ObjectId(id),
+          status: "pending",
+        });
 
-        if (result.modifiedCount === 0) {
+        if (!rider) {
           return res.status(404).send({
             message: "Rider not found or already processed",
           });
         }
 
-        console.log(`✅ Rider approved: ${id}`);
-        res.json({
+        const email = rider?.createdBy?.email;
+        if (!email) {
+          return res.status(400).send({ message: "Rider email not found" });
+        }
+
+        const now = new Date();
+
+        // 2) Approve rider
+        const riderUpdate = await ridersCollection.updateOne(
+          { _id: new ObjectId(id), status: "pending" },
+          {
+            $set: {
+              status: "approved",
+              approvedAt: now,
+            },
+          },
+        );
+
+        // 3) Update user role by email ✅
+        const userUpdate = await usersCollection.updateOne(
+          { email },
+          {
+            $set: {
+              role: "rider",
+              updatedAt: now,
+            },
+          },
+        );
+
+        if (userUpdate.matchedCount === 0) {
+          return res.status(404).send({
+            message: `User not found in users collection for email: ${email}`,
+          });
+        }
+
+        res.send({
           success: true,
-          message: "Rider approved successfully!",
-          modifiedCount: result.modifiedCount,
+          message: "Rider approved & user role updated to rider",
+          riderModified: riderUpdate.modifiedCount,
+          userMatched: userUpdate.matchedCount,
+          userModified: userUpdate.modifiedCount,
         });
       } catch (error) {
-        console.error("❌ Approve error:", error);
-        res.status(500).json({ error: "Failed to approve rider" });
+        console.error("Approve error:", error);
+        res.status(500).send({ message: "Failed to approve rider" });
       }
     });
 
