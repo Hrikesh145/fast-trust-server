@@ -87,15 +87,28 @@ async function run() {
     const verifyAdmin = async (req, res, next) => {
       try {
         const email = req.decoded?.email;
-        if (!email) return res.status(401).send({ message: "Unauthorized" });
+
+        if (!email) {
+          return res
+            .status(401)
+            .send({ message: "Unauthorized: no email in token" });
+        }
 
         const user = await usersCollection.findOne({ email });
-        if (!user || user.role !== "admin") {
-          return res.status(403).send({ message: "Forbidden (admin only)" });
+
+        if (!user) {
+          return res
+            .status(403)
+            .send({ message: "Forbidden: user not found in DB" });
+        }
+
+        if (user.role !== "admin") {
+          return res.status(403).send({ message: "Forbidden: admin only" });
         }
 
         next();
       } catch (err) {
+        console.error("verifyAdmin error:", err?.stack || err); // ✅
         res.status(500).send({ message: err.message });
       }
     };
@@ -246,6 +259,23 @@ async function run() {
       },
     );
 
+    app.get("/users/me", verifyFBToken, async (req, res) => {
+      try {
+        const email = req.decoded?.email;
+
+        const user = await usersCollection.findOne(
+          { email },
+          { projection: { email: 1, name: 1, role: 1, status: 1 } },
+        );
+
+        if (!user) return res.status(404).send({ message: "User not found" });
+
+        res.send(user);
+      } catch (err) {
+        res.status(500).send({ message: err.message });
+      }
+    });
+
     app.get("/parcels", verifyFBToken, async (req, res) => {
       const cursor = parcelsCollection.find();
       const parcels = await cursor.toArray();
@@ -270,17 +300,7 @@ async function run() {
       res.send(parcels);
     });
 
-    app.get("/parcels/:id", async (req, res) => {
-      try {
-        const id = req.params.id;
-        const query = { _id: new ObjectId(id) };
-        const result = await parcelsCollection.findOne(query);
-        res.send(result);
-      } catch (error) {
-        console.error("Get parcel error:", error);
-        res.status(500).send({ error: error.message });
-      }
-    });
+    
 
     //payment get
     app.get("/payments", verifyFBToken, async (req, res) => {
@@ -302,6 +322,111 @@ async function run() {
     });
 
     // Track parcel by trackingId (public id)
+    
+
+    app.post("/parcels", verifyFBToken, async (req, res) => {
+      try {
+        const parcel = req.body;
+
+        const nowISO = new Date().toISOString();
+
+        // ✅ enforce creator from token (optional but good)
+        const emailFromToken = req.decoded?.email;
+
+        const parcelDoc = {
+          ...parcel,
+
+          //  normalize paymentType
+          paymentType: (parcel.paymentType || "cod").toLowerCase(), // cod|paid
+
+          //  default delivery status
+          status: parcel.status || "created",
+
+          // rider assignment fields
+          assignedRiderId: parcel.assignedRiderId || "",
+          assignedRiderAtISO: parcel.assignedRiderAtISO || "",
+
+          // timeline history (optional but useful)
+          statusHistory: Array.isArray(parcel.statusHistory)
+            ? parcel.statusHistory
+            : [{ status: "created", timeISO: nowISO }],
+
+          createdAtISO: parcel.createdAtISO || nowISO,
+
+          createdBy: {
+            ...(parcel.createdBy || {}),
+            email: parcel?.createdBy?.email || emailFromToken,
+          },
+        };
+
+        const result = await parcelsCollection.insertOne(parcelDoc);
+        res.send(result);
+      } catch (err) {
+        res.status(500).send({ message: err.message });
+      }
+    });
+
+    app.patch(
+      "/parcels/:id/assign-rider",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { riderId } = req.body;
+
+          if (!ObjectId.isValid(id))
+            return res.status(400).send({ message: "Invalid parcel id" });
+          if (!ObjectId.isValid(riderId))
+            return res.status(400).send({ message: "Invalid rider id" });
+
+          const nowISO = new Date().toISOString();
+
+          const result = await parcelsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                assignedRiderId: riderId,
+                assignedRiderAtISO: nowISO,
+                status: "assigned",
+              },
+              $push: {
+                statusHistory: { status: "assigned", timeISO: nowISO },
+              },
+            },
+          );
+
+          res.send({ success: true, modifiedCount: result.modifiedCount });
+        } catch (err) {
+          res.status(500).send({ message: err.message });
+        }
+      },
+    );
+
+    app.get("/parcels/admin", verifyFBToken, verifyAdmin, async (req, res) => {
+      try {
+        console.log("✅ /parcels/admin hit", req.query);
+
+        const { paymentType, status } = req.query;
+
+        const query = {};
+        if (paymentType) query.paymentType = paymentType.toLowerCase();
+        if (status) query.status = status;
+
+        console.log("Mongo query:", query);
+
+        const parcels = await parcelsCollection
+          .find(query)
+          .sort({ createdAtISO: -1 })
+          .toArray();
+
+        res.send(parcels);
+      } catch (err) {
+        console.error("/parcels/admin error:", err?.stack || err); // ✅
+        res.status(500).send({ message: err.message });
+      }
+    });
+
     app.get("/parcels/track/:trackingId", async (req, res) => {
       try {
         const { trackingId } = req.params;
@@ -340,13 +465,17 @@ async function run() {
       }
     });
 
-    app.post("/parcels", async (req, res) => {
-      const parcel = req.body;
-      console.log("New parcel added:", parcel);
-      const result = await parcelsCollection.insertOne(parcel);
-      res.send(result);
+    app.get("/parcels/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+        const result = await parcelsCollection.findOne(query);
+        res.send(result);
+      } catch (error) {
+        console.error("Get parcel error:", error);
+        res.status(500).send({ error: error.message });
+      }
     });
-
     // payment
 
     app.post("/create-payment-intent", async (req, res) => {
