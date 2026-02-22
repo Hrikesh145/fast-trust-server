@@ -60,6 +60,9 @@ async function run() {
       { nid: 1 },
       { unique: true, sparse: true },
     );
+    await parcelsCollection.createIndex({ "createdBy.email": 1 });
+    await parcelsCollection.createIndex({ assignedRiderId: 1 });
+    await parcelsCollection.createIndex({ status: 1 });
 
     // Custom Middleware
     const verifyFBToken = async (req, res, next) => {
@@ -109,6 +112,26 @@ async function run() {
         next();
       } catch (err) {
         console.error("verifyAdmin error:", err?.stack || err); // ✅
+        res.status(500).send({ message: err.message });
+      }
+    };
+
+    //Rider
+    const verifyRider = async (req, res, next) => {
+      try {
+        const email = req.decoded?.email;
+        if (!email) return res.status(401).send({ message: "Unauthorized" });
+
+        const user = await usersCollection.findOne({ email });
+        if (!user) return res.status(403).send({ message: "User not found" });
+
+        if (user.role !== "rider") {
+          return res.status(403).send({ message: "Forbidden: rider only" });
+        }
+
+        next();
+      } catch (err) {
+        console.error("verifyRider error:", err?.stack || err);
         res.status(500).send({ message: err.message });
       }
     };
@@ -259,6 +282,121 @@ async function run() {
       },
     );
 
+    //Rider
+    app.get("/riders/me", verifyFBToken, verifyRider, async (req, res) => {
+      try {
+        const email = req.decoded.email;
+
+        const rider = await ridersCollection.findOne(
+          { "createdBy.email": email },
+          { projection: { name: 1, phone: 1, status: 1, createdBy: 1 } },
+        );
+
+        if (!rider)
+          return res.status(404).send({ message: "Rider profile not found" });
+
+        res.send(rider);
+      } catch (err) {
+        res.status(500).send({ message: err.message });
+      }
+    });
+
+    app.get("/parcels/rider", verifyFBToken, verifyRider, async (req, res) => {
+      try {
+        const email = req.decoded.email;
+
+        const rider = await ridersCollection.findOne({
+          "createdBy.email": email,
+        });
+        if (!rider) return res.status(404).send({ message: "Rider not found" });
+
+        const parcels = await parcelsCollection
+          .find({ assignedRiderId: rider._id.toString() })
+          .sort({ createdAtISO: -1 })
+          .toArray();
+
+        res.send(parcels);
+      } catch (err) {
+        res.status(500).send({ message: err.message });
+      }
+    });
+
+    app.patch(
+      "/parcels/:id/rider-status",
+      verifyFBToken,
+      verifyRider,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { status } = req.body;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({ message: "Invalid parcel id" });
+          }
+
+          const email = req.decoded.email;
+
+          const rider = await ridersCollection.findOne({
+            "createdBy.email": email,
+          });
+          if (!rider)
+            return res.status(404).send({ message: "Rider not found" });
+
+          const parcel = await parcelsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!parcel)
+            return res.status(404).send({ message: "Parcel not found" });
+
+          // 🔒 must be assigned to this rider
+          if (parcel.assignedRiderId !== rider._id.toString()) {
+            return res
+              .status(403)
+              .send({ message: "This parcel is not assigned to you" });
+          }
+
+          // ✅ enforce correct flow
+          const allowedNext = {
+            assigned: "picked_up",
+            picked_up: "in_transit",
+            in_transit: "delivered",
+          };
+
+          const expected = allowedNext[parcel.status];
+          if (expected !== status) {
+            return res.status(400).send({
+              message: `Invalid transition: ${parcel.status} → ${status}. Expected: ${expected}`,
+            });
+          }
+
+          const nowISO = new Date().toISOString();
+
+          const result = await parcelsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                status,
+                updatedAtISO: nowISO,
+              },
+              $push: {
+                statusHistory: {
+                  status,
+                  timeISO: nowISO,
+                  by: email,
+                  byRole: "rider",
+                },
+              },
+            },
+          );
+
+          res.send({ success: true, modifiedCount: result.modifiedCount });
+        } catch (err) {
+          console.error("rider-status error:", err?.stack || err);
+          res.status(500).send({ message: err.message });
+        }
+      },
+    );
+
     app.get("/users/me", verifyFBToken, async (req, res) => {
       try {
         const email = req.decoded?.email;
@@ -283,7 +421,7 @@ async function run() {
     });
 
     // Parcels api
-    app.get("/parcels/user", async (req, res) => {
+    app.get("/parcels/user", verifyFBToken, async (req, res) => {
       const { email } = req.query;
 
       if (!email) {
@@ -299,8 +437,6 @@ async function run() {
       const parcels = await cursor.toArray();
       res.send(parcels);
     });
-
-    
 
     //payment get
     app.get("/payments", verifyFBToken, async (req, res) => {
@@ -322,7 +458,6 @@ async function run() {
     });
 
     // Track parcel by trackingId (public id)
-    
 
     app.post("/parcels", verifyFBToken, async (req, res) => {
       try {
@@ -366,6 +501,7 @@ async function run() {
       }
     });
 
+    // ✅ PATCH /parcels/:id/assign-rider (admin only)
     app.patch(
       "/parcels/:id/assign-rider",
       verifyFBToken,
@@ -380,49 +516,178 @@ async function run() {
           if (!ObjectId.isValid(riderId))
             return res.status(400).send({ message: "Invalid rider id" });
 
+          const parcel = await parcelsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!parcel)
+            return res.status(404).send({ message: "Parcel not found" });
+
+          // ✅ Load rider and store snapshot so UI can show name/phone
+          const rider = await ridersCollection.findOne({
+            _id: new ObjectId(riderId),
+          });
+          if (!rider)
+            return res.status(404).send({ message: "Rider not found" });
+          if (rider.status !== "approved")
+            return res.status(400).send({ message: "Rider is not approved" });
+
           const nowISO = new Date().toISOString();
+
+          const riderSnapshot = {
+            id: rider._id.toString(),
+            name: rider.name || "Unnamed",
+            phone: rider.phone || "",
+            email: rider.createdBy?.email || rider.email || "",
+          };
+
+          // optional rule: don't allow assign if delivered
+          if (parcel.status === "delivered") {
+            return res
+              .status(400)
+              .send({ message: "Delivered parcel cannot be assigned" });
+          }
 
           const result = await parcelsCollection.updateOne(
             { _id: new ObjectId(id) },
             {
               $set: {
-                assignedRiderId: riderId,
+                assignedRiderId: riderSnapshot.id, // keep if you want
+                assignedRider: riderSnapshot, // ✅ important
                 assignedRiderAtISO: nowISO,
                 status: "assigned",
               },
               $push: {
-                statusHistory: { status: "assigned", timeISO: nowISO },
+                statusHistory: {
+                  status: "assigned",
+                  timeISO: nowISO,
+                  rider: riderSnapshot,
+                  by: req.decoded?.email || "",
+                },
+              },
+            },
+          );
+
+          res.send({
+            success: true,
+            modifiedCount: result.modifiedCount,
+            assignedRider: riderSnapshot,
+          });
+        } catch (err) {
+          console.error("assign-rider error:", err?.stack || err);
+          res.status(500).send({ message: err.message });
+        }
+      },
+    );
+
+    // ✅ PATCH /parcels/:id/unassign-rider (admin only)
+    app.patch(
+      "/parcels/:id/unassign-rider",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id))
+            return res.status(400).send({ message: "Invalid parcel id" });
+
+          const parcel = await parcelsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!parcel)
+            return res.status(404).send({ message: "Parcel not found" });
+
+          // optional rule: don't allow unassign after picked_up
+          if (
+            ["picked_up", "in_transit", "delivered"].includes(parcel.status)
+          ) {
+            return res.status(400).send({
+              message: `Cannot unassign when status is ${parcel.status}`,
+            });
+          }
+
+          if (!parcel.assignedRiderId && !parcel.assignedRider) {
+            return res
+              .status(400)
+              .send({ message: "Parcel has no assigned rider" });
+          }
+
+          const nowISO = new Date().toISOString();
+
+          const removedRider = parcel.assignedRider || {
+            id: parcel.assignedRiderId || "",
+            name: "",
+            phone: "",
+            email: "",
+          };
+
+          const result = await parcelsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                assignedRiderId: "",
+                assignedRider: null,
+                assignedRiderAtISO: "",
+                unassignedAtISO: nowISO,
+                status: "created",
+              },
+              $push: {
+                statusHistory: {
+                  status: "unassigned",
+                  timeISO: nowISO,
+                  removedRider,
+                  by: req.decoded?.email || "",
+                },
               },
             },
           );
 
           res.send({ success: true, modifiedCount: result.modifiedCount });
         } catch (err) {
+          console.error("unassign-rider error:", err?.stack || err);
           res.status(500).send({ message: err.message });
         }
       },
     );
 
+    // ✅ GET /parcels/admin (admin only)
     app.get("/parcels/admin", verifyFBToken, verifyAdmin, async (req, res) => {
       try {
-        console.log("✅ /parcels/admin hit", req.query);
-
         const { paymentType, status } = req.query;
 
         const query = {};
         if (paymentType) query.paymentType = paymentType.toLowerCase();
         if (status) query.status = status;
 
-        console.log("Mongo query:", query);
-
         const parcels = await parcelsCollection
           .find(query)
+          .project({
+            parcelTitle: 1,
+            parcelType: 1,
+            paymentType: 1,
+            deliveryCost: 1,
+            codAmount: 1,
+            status: 1,
+            createdAtISO: 1,
+            trackingId: 1,
+            senderRegion: 1,
+            senderCenter: 1,
+            receiverRegion: 1,
+            receiverCenter: 1,
+            createdBy: 1,
+
+            // ✅ important:
+            assignedRider: 1,
+            assignedRiderId: 1,
+            assignedRiderAtISO: 1,
+            unassignedAtISO: 1,
+            statusHistory: 1,
+          })
           .sort({ createdAtISO: -1 })
           .toArray();
 
         res.send(parcels);
       } catch (err) {
-        console.error("/parcels/admin error:", err?.stack || err); // ✅
+        console.error("/parcels/admin error:", err?.stack || err);
         res.status(500).send({ message: err.message });
       }
     });
@@ -758,7 +1023,7 @@ async function run() {
       }
     });
     // 🔥 GET ACTIVE RIDERS (status: "approved")
-    app.get("/active-riders", async (req, res) => {
+    app.get("/active-riders", verifyFBToken, verifyAdmin, async (req, res) => {
       try {
         const { page = 1, limit = 10, search = "" } = req.query;
         const skip = (parseInt(page) - 1) * parseInt(limit);
