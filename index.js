@@ -1119,6 +1119,8 @@ app.get("/", (req, res) => {
   res.send("Fast Trust Server is running");
 });
 
+module.exports = app;
+
 // app.listen(port, () => {
 //   console.log(`Server is running on port ${port}`);
 // });
